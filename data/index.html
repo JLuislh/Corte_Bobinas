@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CNC Control Dual</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; }
+        .card { background: white; border-radius: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); padding: 25px; width: 450px; max-width: 100%; }
+        .control-panel { background: white; border-radius: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); padding: 20px; width: 100%; max-width: 940px; margin-bottom: 10px; display: flex; gap: 20px; justify-content: center; flex-wrap: wrap; }
+        h2 { margin-top: 0; color: #1a73e8; display: flex; align-items: center; gap: 10px; }
+        .pos { background: #e8f0fe; border-radius: 15px; padding: 15px; margin: 15px 0; font-size: 2.5em; font-weight: bold; color: #1a73e8; text-align: center; }
+        button { padding: 14px; margin: 8px 0; border: none; border-radius: 12px; font-size: 16px; font-weight: bold; cursor: pointer; transition: all 0.2s; }
+        button:hover { transform: scale(1.02); box-shadow: 0 4px 10px rgba(0,0,0,0.15); }
+        .btn-home { background: #fbbc05; color: #333; width: 100%; }
+        .btn-start { background: #34a853; color: white; width: 100%; }
+        .btn-stop { background: #ea4335; color: white; width: 100%; }
+        .btn-manual { background: #ff6d01; color: white; width: 48%; display: inline-block; }
+        .btn-both { background: #673ab7; color: white; width: 200px; }
+        .btn-emergency { background: #b71c1c; color: white; width: 100%; font-size: 22px; padding: 20px; border-radius: 16px; border: 4px solid #ff1744; letter-spacing: 2px; box-shadow: 0 0 18px rgba(183,28,28,0.5); }
+        .btn-emergency:hover { background: #d32f2f; box-shadow: 0 0 28px rgba(183,28,28,0.8); }
+        .emergency-panel { background: #ffebee; border-radius: 20px; box-shadow: 0 4px 15px rgba(183,28,28,0.25); padding: 16px 20px; width: 100%; max-width: 940px; margin-bottom: 5px; }
+        .btn-mem { background: #0d47a1; color: white; width: 140px; } /* Azul oscuro para memorias */
+        .flex { display: flex; gap: 10px; justify-content: space-between; }
+        .input-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin: 8px 0;
+        }
+        .input-group input {
+            flex: 1;
+            padding: 8px;
+            border: 2px solid #ddd;
+            border-radius: 10px;
+            font-size: 16px;
+            box-sizing: border-box;
+            transition: border 0.2s;
+            text-align: center;
+            min-width: 0;
+        }
+        .input-group input:focus {
+            border-color: #1a73e8;
+            outline: none;
+        }
+        .input-group button {
+            width: 40px;
+            height: 40px;
+            padding: 0;
+            border-radius: 10px;
+            background: #e0e0e0;
+            color: #333;
+            font-size: 22px;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0;
+            flex-shrink: 0;
+        }
+        .input-group button:active {
+            background: #bdbdbd;
+        }
+        .pausas-container {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin: 8px 0;
+        }
+        label { font-weight: bold; display: block; margin-top: 15px; color: #555; }
+        hr { border: none; border-top: 2px solid #eee; margin: 25px 0; }
+        .motor2 { border-top: 4px solid #4285f4; margin-top: 20px; padding-top: 20px; }
+        .motor-title { color: #4285f4; }
+        @media (max-width: 500px) { body { padding: 10px; } .card { padding: 20px; } .pos { font-size: 2em; } }
+    </style>
+</head>
+<body>
+    <!-- PARO DE EMERGENCIA -->
+    <div class="emergency-panel">
+        <button class="btn-emergency" onclick="stopAll()">⛔ PARO DE EMERGENCIA</button>
+    </div>
+
+    <!-- Panel de control unificado -->
+    <div class="control-panel">
+        <button class="btn-both" onclick="startBoth()">▶ INICIAR AMBOS</button>
+        <button class="btn-both" onclick="stopBoth()" style="background:#d32f2f;">⏹ DETENER AMBOS</button>
+    </div>
+
+    <!-- Memorias -->
+    <div class="control-panel" style="justify-content: space-around; flex-wrap: wrap;">
+        <button class="btn-mem" onclick="guardarMemoria(1)">💾 Guardar Mem 1</button>
+        <button class="btn-mem" onclick="cargarMemoria(1)">📂 Cargar Mem 1</button>
+        <button class="btn-mem" onclick="guardarMemoria(2)">💾 Guardar Mem 2</button>
+        <button class="btn-mem" onclick="cargarMemoria(2)">📂 Cargar Mem 2</button>
+        <button class="btn-mem" onclick="guardarMemoria(3)">💾 Guardar Mem 3</button>
+        <button class="btn-mem" onclick="cargarMemoria(3)">📂 Cargar Mem 3</button>
+    </div>
+
+    <div class="card">
+        <h2>🔧 MOTOR 1</h2>
+        <div class="pos">
+            <span id="pos1">0.000</span> <small>inches</small>
+        </div>
+        <button class="btn-home" onclick="fetch('/homing')">🏠 HOMING MOTOR 1 (PRECISO)</button>
+        
+        <label>Distancia de ciclo (inches):</label>
+        <div class="input-group">
+            <button onclick="decrement('dist1', parseFloat(document.getElementById('dist1').step))">−</button>
+            <input type="number" id="dist1" step="0.001" min="0" value="0.4">
+            <button onclick="increment('dist1', parseFloat(document.getElementById('dist1').step))">+</button>
+        </div>
+
+        <label>Velocidad (µs/paso):</label>
+        <div class="input-group">
+            <button onclick="decrement('speed1', parseFloat(document.getElementById('speed1').step))">−</button>
+            <input type="number" id="speed1" step="1" min="50" value="400">
+            <button onclick="increment('speed1', parseFloat(document.getElementById('speed1').step))">+</button>
+        </div>
+        
+        <label>Pausas (ms):</label>
+        <div class="pausas-container">
+            <div class="input-group">
+                <button onclick="decrement('delayStart1', 1)">−</button>
+                <input type="number" id="delayStart1" step="1" min="0" placeholder="Inicio">
+                <button onclick="increment('delayStart1', 1)">+</button>
+            </div>
+            <div class="input-group">
+                <button onclick="decrement('delayEnd1', 1)">−</button>
+                <input type="number" id="delayEnd1" step="1" min="0" placeholder="Final">
+                <button onclick="increment('delayEnd1', 1)">+</button>
+            </div>
+        </div>
+        
+        <div class="flex" style="margin-top: 15px;">
+            <button class="btn-manual" onmousedown="onMoveButtonDown1('backward')" onmouseup="onMoveButtonUp1('backward')" onmouseleave="onMoveButtonUp1('backward')">◀ ATRÁS</button>
+            <button class="btn-manual" onmousedown="onMoveButtonDown1('forward')" onmouseup="onMoveButtonUp1('forward')" onmouseleave="onMoveButtonUp1('forward')">ADELANTE ▶</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2 class="motor-title">⚙ MOTOR 2</h2>
+        <div class="pos" style="background: #e3f2fd;">
+            <span id="pos2">0.000</span> <small>inches</small>
+        </div>
+        <button class="btn-home" onclick="fetch('/homingmotor2')">🏠 HOMING MOTOR 2 (PRECISO)</button>
+        
+        <label>Distancia de ciclo (inches):</label>
+        <div class="input-group">
+            <button onclick="decrement('dist2', parseFloat(document.getElementById('dist2').step))">−</button>
+            <input type="number" id="dist2" step="0.001" min="0" value="0.4">
+            <button onclick="increment('dist2', parseFloat(document.getElementById('dist2').step))">+</button>
+        </div>
+
+        <label>Velocidad (µs/paso):</label>
+        <div class="input-group">
+            <button onclick="decrement('speed2', parseFloat(document.getElementById('speed2').step))">−</button>
+            <input type="number" id="speed2" step="1" min="50" value="800">
+            <button onclick="increment('speed2', parseFloat(document.getElementById('speed2').step))">+</button>
+        </div>
+        
+        <label>Pausas (ms):</label>
+        <div class="pausas-container">
+            <div class="input-group">
+                <button onclick="decrement('delayStart2', 1)">−</button>
+                <input type="number" id="delayStart2" step="1" min="0" placeholder="Inicio">
+                <button onclick="increment('delayStart2', 1)">+</button>
+            </div>
+            <div class="input-group">
+                <button onclick="decrement('delayEnd2', 1)">−</button>
+                <input type="number" id="delayEnd2" step="1" min="0" placeholder="Final">
+                <button onclick="increment('delayEnd2', 1)">+</button>
+            </div>
+        </div>
+        
+        <div class="flex" style="margin-top: 15px;">
+            <button class="btn-manual" onmousedown="onMoveButtonDown2('backward')" onmouseup="onMoveButtonUp2('backward')" onmouseleave="onMoveButtonUp2('backward')">◀ ATRÁS</button>
+            <button class="btn-manual" onmousedown="onMoveButtonDown2('forward')" onmouseup="onMoveButtonUp2('forward')" onmouseleave="onMoveButtonUp2('forward')">ADELANTE ▶</button>
+        </div>
+    </div>
+
+    <script>
+        // Cargar configuraciones al inicio
+        fetch('/getsettings').then(r => r.json()).then(data => {
+            document.getElementById('dist1').value = data.dist1;
+            document.getElementById('speed1').value = data.speed1;
+            document.getElementById('delayStart1').value = data.delayStart1;
+            document.getElementById('delayEnd1').value = data.delayEnd1;
+            document.getElementById('dist2').value = data.dist2;
+            document.getElementById('speed2').value = data.speed2;
+            document.getElementById('delayStart2').value = data.delayStart2;
+            document.getElementById('delayEnd2').value = data.delayEnd2;
+        });
+
+        // Funciones para incrementar/decrementar valores
+        function increment(inputId, delta) {
+            let input = document.getElementById(inputId);
+            let newVal = (parseFloat(input.value) || 0) + delta;
+            if (input.hasAttribute('min')) {
+                newVal = Math.max(parseFloat(input.min), newVal);
+            }
+            if (delta < 1) {
+                newVal = Math.round(newVal * 1000) / 1000;
+            } else {
+                newVal = Math.round(newVal);
+            }
+            input.value = newVal;
+            input.dispatchEvent(new Event('change'));
+        }
+
+        function decrement(inputId, delta) {
+            let input = document.getElementById(inputId);
+            let newVal = (parseFloat(input.value) || 0) - delta;
+            if (input.hasAttribute('min')) {
+                newVal = Math.max(parseFloat(input.min), newVal);
+            }
+            if (delta < 1) {
+                newVal = Math.round(newVal * 1000) / 1000;
+            } else {
+                newVal = Math.round(newVal);
+            }
+            input.value = newVal;
+            input.dispatchEvent(new Event('change'));
+        }
+
+        // Funciones de actualización al servidor
+        function updateSpeed1(v) { if(v >= 50) fetch('/speed1?val=' + v); }
+        function updateSpeed2(v) { if(v >= 50) fetch('/speed2?val=' + v); }
+
+        function startAuto1() { fetch('/startauto1?dist=' + document.getElementById('dist1').value); }
+        function stopAuto1()  { fetch('/stopauto1'); }
+        
+        function onMoveButtonDown1(dir) {
+            fetch('/movefast1?dir=' + dir);
+        }
+        function onMoveButtonUp1(dir) {
+            fetch('/stopfast1');
+        }
+
+        function startAuto2() { fetch('/startauto2?dist=' + document.getElementById('dist2').value); }
+        function stopAuto2()  { fetch('/stopauto2'); }
+        
+        function onMoveButtonDown2(dir) {
+            fetch('/movefast2?dir=' + dir);
+        }
+        function onMoveButtonUp2(dir) {
+            fetch('/stopfast2');
+        }
+
+        function startBoth() {
+            let d1 = document.getElementById('dist1').value;
+            let d2 = document.getElementById('dist2').value;
+            fetch('/startboth?dist1=' + d1 + '&dist2=' + d2);
+        }
+        function stopBoth() {
+            fetch('/stopboth');
+        }
+        function stopAll() {
+            fetch('/stopall');
+        }
+
+        // Funciones para memorias
+        function guardarMemoria(num) {
+            let data = {
+                dist1: document.getElementById('dist1').value,
+                speed1: document.getElementById('speed1').value,
+                delayStart1: document.getElementById('delayStart1').value,
+                delayEnd1: document.getElementById('delayEnd1').value,
+                dist2: document.getElementById('dist2').value,
+                speed2: document.getElementById('speed2').value,
+                delayStart2: document.getElementById('delayStart2').value,
+                delayEnd2: document.getElementById('delayEnd2').value
+            };
+            fetch('/saveMem?num=' + num, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            }).then(response => {
+                if(response.ok) alert('Memoria ' + num + ' guardada');
+            });
+        }
+
+        function cargarMemoria(num) {
+            fetch('/loadMem?num=' + num)
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('dist1').value = data.dist1;
+                document.getElementById('speed1').value = data.speed1;
+                document.getElementById('delayStart1').value = data.delayStart1;
+                document.getElementById('delayEnd1').value = data.delayEnd1;
+                document.getElementById('dist2').value = data.dist2;
+                document.getElementById('speed2').value = data.speed2;
+                document.getElementById('delayStart2').value = data.delayStart2;
+                document.getElementById('delayEnd2').value = data.delayEnd2;
+
+                // Actualizar variables en el servidor
+                fetch('/setdist1?val=' + data.dist1);
+                fetch('/setdist2?val=' + data.dist2);
+                // Disparar eventos change para velocidad y pausas
+                document.getElementById('speed1').dispatchEvent(new Event('change'));
+                document.getElementById('delayStart1').dispatchEvent(new Event('change'));
+                document.getElementById('delayEnd1').dispatchEvent(new Event('change'));
+                document.getElementById('speed2').dispatchEvent(new Event('change'));
+                document.getElementById('delayStart2').dispatchEvent(new Event('change'));
+                document.getElementById('delayEnd2').dispatchEvent(new Event('change'));
+
+                alert('Memoria ' + num + ' cargada');
+            });
+        }
+
+        // Asignar manejadores change para enviar cambios al servidor
+        document.getElementById('delayStart1').onchange = function() { fetch('/delaystart1?val=' + this.value); };
+        document.getElementById('delayEnd1').onchange   = function() { fetch('/delayend1?val='   + this.value); };
+        document.getElementById('delayStart2').onchange = function() { fetch('/delaystart2?val=' + this.value); };
+        document.getElementById('delayEnd2').onchange   = function() { fetch('/delayend2?val='   + this.value); };
+
+        document.getElementById('speed1').onchange = function() { updateSpeed1(this.value); };
+        document.getElementById('speed2').onchange = function() { updateSpeed2(this.value); };
+
+        // --- WebSocket para actualizaciones en tiempo real ---
+        var ws;
+
+        function initWebSocket() {
+            // Intenta conectar al WebSocket en la misma IP que la página web
+            ws = new WebSocket('ws://' + window.location.hostname + '/ws');
+
+            ws.onopen = function(event) {
+                console.log('WebSocket connection opened');
+            };
+
+            ws.onmessage = function(event) {
+                // Parsear el mensaje JSON recibido
+                var data = JSON.parse(event.data);
+                if (data.pos1 !== undefined) {
+                    document.getElementById('pos1').innerText = parseFloat(data.pos1).toFixed(3);
+                }
+                if (data.pos2 !== undefined) {
+                    document.getElementById('pos2').innerText = parseFloat(data.pos2).toFixed(3);
+                }
+            };
+
+            ws.onclose = function(event) {
+                console.log('WebSocket connection closed, trying to reconnect in 3 seconds...');
+                setTimeout(initWebSocket, 3000); // Intenta reconectar después de 3 segundos
+            };
+
+            ws.onerror = function(error) {
+                console.error('WebSocket error: ', error);
+            };
+        }
+
+        // Iniciar la conexión WebSocket cuando la página se carga
+        window.onload = initWebSocket;
+    </script>
+</body>
+</html>
