@@ -198,6 +198,11 @@ void handleMotor() {
         unsigned long pauseDuration = (currentState == PAUSE_AT_END) ? delay_at_end_ms : delay_at_start_ms;
         if ((now_us - pauseStartTime) >= (pauseDuration * 1000UL)) {
             goingForward = (currentState == PAUSE_AT_END) ? false : true;
+            if (currentState == PAUSE_AT_START) {
+                // Recalcular target con la distancia actual (permite cambiar en caliente)
+                currentPosition_steps = 0;
+                targetPosition_steps = (long)(autoDistance_inches * steps_per_unit_m1);
+            }
             currentState = RUNNING;
             updateStepTimer(true);
         }
@@ -353,6 +358,11 @@ void handleMotor2() {
         unsigned long pauseDuration = (currentState2 == PAUSE_AT_END2) ? delay_at_end2_ms : delay_at_start2_ms;
         if ((now_us - pauseStartTime2) >= (pauseDuration * 1000UL)) {
             goingForward2 = (currentState2 == PAUSE_AT_END2) ? false : true;
+            if (currentState2 == PAUSE_AT_START2) {
+                // Recalcular target con la distancia actual (permite cambiar en caliente)
+                currentPosition2_steps = 0;
+                targetPosition2_steps = (long)(autoDistance2_inches * steps_per_unit_m2);
+            }
             currentState2 = RUNNING2;
             updateStepTimer2(true);
         }

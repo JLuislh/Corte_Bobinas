@@ -71,6 +71,6 @@ The web UI (`data/index.html`) is pure HTML/CSS/JS — no build step needed. Aft
 
 ### Connectivity
 
-- WiFi credentials are hardcoded in `include/config.h`
+- WiFi credentials live in `include/secrets.h` (gitignored); copy `include/secrets.example.h` to create it
 - OTA hostname and IP target are in `platformio.ini` (`[env:esp32dev-ota]`)
 - WebSocket endpoint: `ws://<device-ip>/ws`

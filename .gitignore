@@ -6,3 +6,4 @@
 .claude/
 .agents/
 skills-lock.json
+include/secrets.h

@@ -316,6 +316,9 @@
         document.getElementById('speed1').onchange = function() { updateSpeed1(this.value); };
         document.getElementById('speed2').onchange = function() { updateSpeed2(this.value); };
 
+        document.getElementById('dist1').onchange = function() { fetch('/setdist1?val=' + this.value); };
+        document.getElementById('dist2').onchange = function() { fetch('/setdist2?val=' + this.value); };
+
         // --- WebSocket para actualizaciones en tiempo real ---
         var ws;
 

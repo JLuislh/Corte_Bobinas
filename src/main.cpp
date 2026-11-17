@@ -284,6 +284,7 @@ void setup() {
             if(speed >= 50) {
                 motor_speed_us = speed;
                 pref.putInt("speed1", speed);
+                if (currentState != IDLE) timerAlarmWrite(stepTimer, motor_speed_us, true);
             }
         }
         request->send(200, "text/plain", "OK");
@@ -295,6 +296,7 @@ void setup() {
             if(speed >= 50) {
                 motor2_speed_us = speed;
                 pref.putInt("speed2", speed);
+                if (currentState2 != IDLE2) timerAlarmWrite(stepTimer2, motor2_speed_us, true);
             }
         }
         request->send(200, "text/plain", "OK");

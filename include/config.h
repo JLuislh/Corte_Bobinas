@@ -18,12 +18,12 @@
 #define EMERGENCY_STOP_PIN       18   // TODO: verificar GPIO correcto en el hardware
 
 // --- WIFI ---
-#define WIFI_SSID "INGENIERIA"
-#define WIFI_PW   "Elettronici17"
+// Credenciales en include/secrets.h (no versionado). Ver secrets.example.h
+#include "secrets.h"
 
 // --- RESOLUCIÓN ---
 const float steps_per_unit_m1 = 8128.0;
-const float steps_per_unit_m2 = 1016.0;
+const float steps_per_unit_m2 = 667.0;
 
 // --- ESTADOS ---
 enum State { IDLE, RUNNING, RETURNING_HOME, HOMING, HOMING_BACKOFF, HOMING_FINE, MANUAL_MOVE, MANUAL_FAST_MOVE, PAUSE_AT_END, PAUSE_AT_START, WAIT_SYNC_END, WAIT_SYNC_START };
