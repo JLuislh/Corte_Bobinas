@@ -5,6 +5,9 @@
 
 // --- PINES ---
 #define STEP_PIN          14
+// OJO: GPIO12 es pin de arranque (MTDI). Si está en HIGH al encender, el ESP32 puede no
+// arrancar (selecciona flash a 1.8 V). Solución de hardware: mover DIR a otro GPIO libre
+// (p. ej. 33) o fijar el voltaje de flash por eFuse. No se puede corregir por software.
 #define DIR_PIN           12
 #define LIMIT_SWITCH_PIN  13
 #define ENABLE_PIN        25   // TODO: verificar GPIO correcto en el hardware

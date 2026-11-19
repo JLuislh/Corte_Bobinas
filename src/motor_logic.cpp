@@ -2,7 +2,7 @@
 #include "motor_logic.h"
 #include "config.h"
 
-// --- DEFINICIÓN REAL DE VARIABLES (Viven aquí en el .cpp) ---
+// --- DEFINICIÓN REAL DE VARIABLES ---
 hw_timer_t *stepTimer = NULL;
 hw_timer_t *stepTimer2 = NULL;
 
@@ -24,22 +24,32 @@ volatile unsigned long delay_at_start2_ms = 0;
 volatile float autoDistance_inches = 0.4;
 volatile float autoDistance2_inches = 0.4;
 volatile bool goingForward = true;
-volatile int motor1_direction_multiplier = 1; // 1 for forward, -1 for backward
+volatile int motor1_direction_multiplier = 1;
 volatile bool goingForward2 = true;
-volatile int motor2_direction_multiplier = 1; // 1 for forward, -1 for backward
+volatile int motor2_direction_multiplier = 1;
 
-bool stepHigh = false;
-bool step2High = false;
-unsigned long pauseStartTime = 0;
-unsigned long pauseStartTime2 = 0;
+static volatile bool stepHigh = false;
+static volatile bool step2High = false;
+static unsigned long pauseStartTime = 0;
+static unsigned long pauseStartTime2 = 0;
 
-// Flag de paro de emergencia: se activa desde cualquier core y detiene las ISRs inmediatamente
+// Paro de emergencia: las ISRs dejan de generar pulsos en cuanto se activa
 volatile bool emergencyStop = false;
 
-// Flag de backoff Motor 2: necesita ser variable de archivo para poder resetearse en homingMotor2()
+// Flags de la fase de backoff del homing
+static bool m1BackoffCleared = false;
 static bool m2BackoffCleared = false;
 
-// --- INTERRUPCIONES (IRAM_ATTR) ---
+// Watchdog del movimiento continuo: si la web deja de mandar keep-alive, el motor se detiene
+static volatile unsigned long lastFastKeep1 = 0;
+static volatile unsigned long lastFastKeep2 = 0;
+static const unsigned long FAST_MOVE_TIMEOUT_MS = 1000;
+
+static const long HOMING_BACKOFF_STEPS_M1 = 500;
+static const long HOMING_BACKOFF_STEPS_M2 = 300;
+
+// --- INTERRUPCIONES ---
+// Cada disparo del timer alterna STEP: un paso completo = 2 disparos (2 × speed_us)
 
 void IRAM_ATTR onStepTimer() {
     if (emergencyStop || currentState == IDLE) return;
@@ -65,373 +75,478 @@ void IRAM_ATTR onStepTimer2() {
     }
 }
 
-// --- FUNCIONES DE ACTUALIZACIÓN DE TIMER (Sintaxis v2.0.14) ---
+// --- HELPERS DE HARDWARE ---
+
+// El homing fino va a media velocidad sin tocar la velocidad configurada
+static uint64_t stepPeriod1() {
+    return (currentState == HOMING_FINE) ? (uint64_t)motor_speed_us * 2 : (uint64_t)motor_speed_us;
+}
+static uint64_t stepPeriod2() {
+    return (currentState2 == HOMING_FINE2) ? (uint64_t)motor2_speed_us * 2 : (uint64_t)motor2_speed_us;
+}
+
+// Motor 1: adelante = DIR LOW
+static void setDir1(bool forward) {
+    goingForward = forward;
+    motor1_direction_multiplier = forward ? 1 : -1;
+    digitalWrite(DIR_PIN, forward ? LOW : HIGH);
+}
+// Motor 2: adelante = DIR HIGH
+static void setDir2(bool forward) {
+    goingForward2 = forward;
+    motor2_direction_multiplier = forward ? 1 : -1;
+    digitalWrite(DIR2_PIN, forward ? HIGH : LOW);
+}
+
+static void enable1(bool on) {
+    digitalWrite(ENABLE_PIN, on ? LOW : HIGH);
+}
+static void enable2(bool on) {
+    digitalWrite(ENABLE2_PIN, on ? LOW : HIGH);
+    digitalWrite(SLEEP2_PIN, on ? HIGH : LOW);
+}
 
 void updateStepTimer(bool enable) {
     if (!stepTimer) return;
+    timerAlarmDisable(stepTimer);
     if (enable) {
-        timerAlarmWrite(stepTimer, motor_speed_us, true);
+        timerWrite(stepTimer, 0);  // evita que el contador quede por encima de una alarma nueva
+        timerAlarmWrite(stepTimer, stepPeriod1(), true);
         timerAlarmEnable(stepTimer);
     } else {
-        timerAlarmDisable(stepTimer);
+        // Si quedó un pulso a medias, el driver ya vio el flanco de subida: contarlo
+        if (stepHigh) {
+            stepHigh = false;
+            currentPosition_steps += motor1_direction_multiplier;
+        }
         digitalWrite(STEP_PIN, LOW);
     }
 }
 
 void updateStepTimer2(bool enable) {
     if (!stepTimer2) return;
+    timerAlarmDisable(stepTimer2);
     if (enable) {
-        timerAlarmWrite(stepTimer2, motor2_speed_us, true);
+        timerWrite(stepTimer2, 0);
+        timerAlarmWrite(stepTimer2, stepPeriod2(), true);
         timerAlarmEnable(stepTimer2);
     } else {
-        timerAlarmDisable(stepTimer2);
+        if (step2High) {
+            step2High = false;
+            currentPosition2_steps += motor2_direction_multiplier;
+        }
         digitalWrite(STEP2_PIN, LOW);
     }
 }
 
-// --- LÓGICA DE CONTROL ---
+// Detiene el timer (contabilizando el pulso pendiente con la dirección anterior),
+// fija la nueva dirección y arranca en el estado indicado
+static void beginMotion1(State s, bool forward) {
+    updateStepTimer(false);
+    setDir1(forward);
+    currentState = s;
+    enable1(true);
+    updateStepTimer(true);
+}
+static void beginMotion2(State2 s, bool forward) {
+    updateStepTimer2(false);
+    setDir2(forward);
+    currentState2 = s;
+    enable2(true);
+    updateStepTimer2(true);
+}
 
-void startBothMotors() {
-    emergencyStop = false; // limpiar paro de emergencia antes de arrancar
+static void haltMotor1() {
+    updateStepTimer(false);
+    currentState = IDLE;
+}
+static void haltMotor2() {
+    updateStepTimer2(false);
+    currentState2 = IDLE2;
+}
+
+static bool isHoming1() {
+    return currentState == HOMING || currentState == HOMING_BACKOFF || currentState == HOMING_FINE;
+}
+static bool isHoming2() {
+    return currentState2 == HOMING2 || currentState2 == HOMING_BACKOFF2 || currentState2 == HOMING_FINE2;
+}
+static bool inCycle1() {
+    return currentState == RUNNING || currentState == WAIT_SYNC_END || currentState == WAIT_SYNC_START ||
+           currentState == PAUSE_AT_END || currentState == PAUSE_AT_START;
+}
+static bool inCycle2() {
+    return currentState2 == RUNNING2 || currentState2 == WAIT_SYNC_END2 || currentState2 == WAIT_SYNC_START2 ||
+           currentState2 == PAUSE_AT_END2 || currentState2 == PAUSE_AT_START2;
+}
+
+// --- COMANDOS ---
+
+static void startCycle1() {
     currentPosition_steps = 0;
     targetPosition_steps = (long)(autoDistance_inches * steps_per_unit_m1);
-    goingForward = true;
-    motor1_direction_multiplier = 1;
-    currentState = RUNNING;
-    updateStepTimer(true);
-
+    beginMotion1(RUNNING, true);
+}
+static void startCycle2() {
     currentPosition2_steps = 0;
     targetPosition2_steps = (long)(autoDistance2_inches * steps_per_unit_m2);
-    goingForward2 = true;
-    motor2_direction_multiplier = 1;
-    currentState2 = RUNNING2;
-    updateStepTimer2(true);
+    beginMotion2(RUNNING2, true);
+}
+
+bool startBothMotors() {
+    // START con cualquier motor en movimiento no hace nada
+    if (currentState != IDLE || currentState2 != IDLE2) return false;
+    emergencyStop = false;
+    startCycle1();
+    startCycle2();
+    return true;
+}
+
+bool startAuto1() {
+    if (currentState != IDLE) return false;
+    emergencyStop = false;
+    startCycle1();
+    return true;
+}
+bool startAuto2() {
+    if (currentState2 != IDLE2) return false;
+    emergencyStop = false;
+    startCycle2();
+    return true;
+}
+
+// Regresa al origen del ciclo; si estaba haciendo homing, se detiene en el lugar
+static void returnHome1() {
+    if (isHoming1()) { haltMotor1(); return; }
+    targetPosition_steps = 0;
+    if (currentPosition_steps == 0) { haltMotor1(); return; }
+    beginMotion1(RETURNING_HOME, currentPosition_steps < 0);
+}
+static void returnHome2() {
+    if (isHoming2()) { haltMotor2(); return; }
+    targetPosition2_steps = 0;
+    if (currentPosition2_steps == 0) { haltMotor2(); return; }
+    beginMotion2(RETURNING_HOME2, currentPosition2_steps < 0);
 }
 
 void stopBothMotors() {
-    targetPosition_steps = 0;
-    currentState = RETURNING_HOME;
-    motor1_direction_multiplier = -1;
-    updateStepTimer(true);
-    
-    targetPosition2_steps = 0;
-    currentState2 = RETURNING_HOME2;
-    motor2_direction_multiplier = -1;
-    updateStepTimer2(true);
+    emergencyStop = false;
+    returnHome1();
+    returnHome2();
+}
+void stopAuto1() {
+    emergencyStop = false;
+    returnHome1();
+}
+void stopAuto2() {
+    emergencyStop = false;
+    returnHome2();
 }
 
+void emergencyStopAll() {
+    emergencyStop = true;   // primero: las ISRs dejan de pulsar de inmediato
+    updateStepTimer(false);
+    updateStepTimer2(false);
+    currentState  = IDLE;
+    currentState2 = IDLE2;
+    m1BackoffCleared = false;
+    m2BackoffCleared = false;
+    enable1(false);
+    enable2(false);
+}
+
+bool homingMotor1() {
+    if (currentState != IDLE) return false;
+    emergencyStop = false;
+    m1BackoffCleared = false;
+    currentPosition_steps = 0;
+    targetPosition_steps = 0;
+    beginMotion1(HOMING, false);
+    return true;
+}
+bool homingMotor2() {
+    if (currentState2 != IDLE2) return false;
+    emergencyStop = false;
+    m2BackoffCleared = false;
+    currentPosition2_steps = 0;
+    targetPosition2_steps = 0;
+    beginMotion2(HOMING2, false);
+    return true;
+}
+
+bool moveBy1(bool forward, float dist) {
+    if (currentState != IDLE) return false;
+    long steps = (long)(dist * steps_per_unit_m1);
+    if (steps <= 0) return false;
+    emergencyStop = false;
+    targetPosition_steps = currentPosition_steps + (forward ? steps : -steps);
+    beginMotion1(MANUAL_MOVE, forward);
+    return true;
+}
+bool moveBy2(bool forward, float dist) {
+    if (currentState2 != IDLE2) return false;
+    long steps = (long)(dist * steps_per_unit_m2);
+    if (steps <= 0) return false;
+    emergencyStop = false;
+    targetPosition2_steps = currentPosition2_steps + (forward ? steps : -steps);
+    beginMotion2(MANUAL_MOVE2, forward);
+    return true;
+}
+
+bool fastMove1(bool forward) {
+    if (currentState != IDLE && currentState != MANUAL_FAST_MOVE) return false;
+    emergencyStop = false;
+    lastFastKeep1 = millis();
+    if (currentState == MANUAL_FAST_MOVE && goingForward == forward) return true;
+    beginMotion1(MANUAL_FAST_MOVE, forward);
+    return true;
+}
+bool fastMove2(bool forward) {
+    if (currentState2 != IDLE2 && currentState2 != MANUAL_FAST_MOVE2) return false;
+    emergencyStop = false;
+    lastFastKeep2 = millis();
+    if (currentState2 == MANUAL_FAST_MOVE2 && goingForward2 == forward) return true;
+    beginMotion2(MANUAL_FAST_MOVE2, forward);
+    return true;
+}
+
+// Solo detiene un movimiento continuo; no afecta ciclos ni homing
+void stopFast1() {
+    if (currentState == MANUAL_FAST_MOVE) haltMotor1();
+}
+void stopFast2() {
+    if (currentState2 == MANUAL_FAST_MOVE2) haltMotor2();
+}
+
+void keepFast1() { lastFastKeep1 = millis(); }
+void keepFast2() { lastFastKeep2 = millis(); }
+
+void setSpeed1(int us) {
+    if (us < 50) return;
+    motor_speed_us = us;
+    if (stepTimer && timerAlarmEnabled(stepTimer)) updateStepTimer(true);
+}
+void setSpeed2(int us) {
+    if (us < 50) return;
+    motor2_speed_us = us;
+    if (stepTimer2 && timerAlarmEnabled(stepTimer2)) updateStepTimer2(true);
+}
+
+// --- LÓGICA DE CONTROL ---
+
 void handleMotor() {
-    static State lastState = IDLE; // Keep track of the previous state
-    static int normalSpeed_m1; // Para guardar la velocidad antes del homing fino
+    static State lastState = IDLE;
     if (currentState != lastState) {
         if (currentState == IDLE) {
-            digitalWrite(ENABLE_PIN, HIGH); // Disable motor
-            updateStepTimer(false); // Ensure timer is off
+            updateStepTimer(false);
+            enable1(false);
         } else {
-            digitalWrite(ENABLE_PIN, LOW); // Enable motor
+            enable1(true);
         }
         lastState = currentState;
     }
+    if (currentState == IDLE) return;
 
-    if (currentState == IDLE) {
-        return;
-    }
-    unsigned long now_us = micros();
     // Sensor NC (normalmente cerrado): pin LOW = libre, pin HIGH = sensor activado
     bool homeSwitch = (digitalRead(LIMIT_SWITCH_PIN) == HIGH);
-    
-    // --- HOMING DE TRES FASES PRECISO ---
-    if (currentState == HOMING) {
-        // Fase 1: Ir hacia el sensor rápido (DIR HIGH)
-        motor1_direction_multiplier = -1;
-        digitalWrite(DIR_PIN, HIGH);
+
+    switch (currentState) {
+    case HOMING:  // Fase 1: rápido hacia el sensor
         if (homeSwitch) {
-            currentPosition_steps = 0;
             updateStepTimer(false);
+            currentPosition_steps = 0;
+            m1BackoffCleared = false;
             currentState = HOMING_BACKOFF;
-            goingForward = false;
+            setDir1(true);
             updateStepTimer(true);
         }
-        return;
-    }
+        break;
 
-    if (currentState == HOMING_BACKOFF) {
-        // Fase 2: Alejarse del sensor (DIR LOW) hasta que se libere + margen extra
-        static bool m1BackoffCleared = false;
-        motor1_direction_multiplier = 1;
-        digitalWrite(DIR_PIN, LOW);
+    case HOMING_BACKOFF:  // Fase 2: alejarse hasta liberar el sensor + margen
         if (!m1BackoffCleared) {
-            if (!homeSwitch) {          // esperar liberación física del sensor
+            if (!homeSwitch) {
                 m1BackoffCleared = true;
                 currentPosition_steps = 0;
-                targetPosition_steps = 500; // pasos extra de margen
+                targetPosition_steps = HOMING_BACKOFF_STEPS_M1;
             }
         } else if (currentPosition_steps >= targetPosition_steps) {
+            updateStepTimer(false);
             m1BackoffCleared = false;
             currentPosition_steps = 0;
-            updateStepTimer(false);
-            normalSpeed_m1 = motor_speed_us;
-            motor_speed_us = normalSpeed_m1 * 2; // mitad de velocidad para fase fina
-            currentState = HOMING_FINE;
-            goingForward = true;
+            currentState = HOMING_FINE;  // stepPeriod1() aplica media velocidad
+            setDir1(false);
             updateStepTimer(true);
         }
-        return;
-    }
+        break;
 
-    if (currentState == HOMING_FINE) {
-        // Fase 3: Volver lentamente hacia el sensor (DIR HIGH, precisión)
-        motor1_direction_multiplier = -1;
-        digitalWrite(DIR_PIN, HIGH);
+    case HOMING_FINE:  // Fase 3: lento hacia el sensor
         if (homeSwitch) {
+            haltMotor1();
             currentPosition_steps = 0;
-            updateStepTimer(false);
-            motor_speed_us = normalSpeed_m1;
-            currentState = IDLE;
             Serial.println("Motor 1 homing preciso completado");
         }
-        return;
-    }
-    
-    if (currentState == PAUSE_AT_END || currentState == PAUSE_AT_START) {
-        updateStepTimer(false);
-        unsigned long pauseDuration = (currentState == PAUSE_AT_END) ? delay_at_end_ms : delay_at_start_ms;
-        if ((now_us - pauseStartTime) >= (pauseDuration * 1000UL)) {
-            goingForward = (currentState == PAUSE_AT_END) ? false : true;
-            if (currentState == PAUSE_AT_START) {
-                // Recalcular target con la distancia actual (permite cambiar en caliente)
+        break;
+
+    case PAUSE_AT_END:
+    case PAUSE_AT_START: {
+        unsigned long dur = (currentState == PAUSE_AT_END) ? delay_at_end_ms : delay_at_start_ms;
+        if ((micros() - pauseStartTime) >= dur * 1000UL) {
+            bool forward = (currentState == PAUSE_AT_START);
+            if (forward) {
+                // Recalcular con la distancia actual (permite cambiarla en caliente)
                 currentPosition_steps = 0;
                 targetPosition_steps = (long)(autoDistance_inches * steps_per_unit_m1);
             }
+            setDir1(forward);
             currentState = RUNNING;
             updateStepTimer(true);
         }
-        return;
+        break;
     }
-    
-    if (currentState == RUNNING) {
+
+    case RUNNING:
         if (goingForward) {
-            motor1_direction_multiplier = 1;
-            digitalWrite(DIR_PIN, LOW);
             if (currentPosition_steps >= targetPosition_steps) {
                 updateStepTimer(false);
                 currentState = WAIT_SYNC_END;
             }
-        } else {
-            motor1_direction_multiplier = -1;
-            digitalWrite(DIR_PIN, HIGH);
-            if (currentPosition_steps <= 0) {
-                updateStepTimer(false);
-                currentState = WAIT_SYNC_START;
-            }
-        }
-    } else if (currentState == MANUAL_MOVE) {
-        if (goingForward) {
-            motor1_direction_multiplier = 1;
-            digitalWrite(DIR_PIN, LOW);
-            if (currentPosition_steps >= targetPosition_steps) {
-                updateStepTimer(false);
-                currentState = IDLE;
-            }
-        } else {
-            motor1_direction_multiplier = -1;
-            digitalWrite(DIR_PIN, HIGH);
-            if (currentPosition_steps <= 0) {
-                updateStepTimer(false);
-                currentState = IDLE;
-            }
-        }
-    } else if (currentState == MANUAL_FAST_MOVE) {
-        // Movimiento rápido/continuo sin límite (solo dirección)
-        if (goingForward) {
-            digitalWrite(DIR_PIN, LOW);
-        } else {
-            digitalWrite(DIR_PIN, HIGH);
-        }
-    } else if (currentState == RETURNING_HOME) {
-        // Regresa a home usando comparación de posición
-        if (currentPosition_steps > targetPosition_steps) {
-            motor1_direction_multiplier = -1;
-            digitalWrite(DIR_PIN, HIGH);
-        } else if (currentPosition_steps < targetPosition_steps) {
-            motor1_direction_multiplier = 1;
-            digitalWrite(DIR_PIN, LOW);
-        } else {
+        } else if (currentPosition_steps <= 0) {
             updateStepTimer(false);
-            currentState = IDLE;
+            currentState = WAIT_SYNC_START;
         }
-    }
-}
+        break;
 
-void homingMotor2() {
-    emergencyStop = false;
-    m2BackoffCleared = false; // Resetear flag para nuevo ciclo de homing
-    currentPosition2_steps = 0;
-    targetPosition2_steps = 0; // Target for homing is 0
-    goingForward2 = false;
-    currentState2 = HOMING2;
-    updateStepTimer2(true);
+    case MANUAL_MOVE:
+    case RETURNING_HOME:
+        if (goingForward ? (currentPosition_steps >= targetPosition_steps)
+                         : (currentPosition_steps <= targetPosition_steps)) {
+            haltMotor1();
+        }
+        break;
+
+    case MANUAL_FAST_MOVE:
+        if (millis() - lastFastKeep1 > FAST_MOVE_TIMEOUT_MS) {
+            haltMotor1();
+            Serial.println("Motor 1: movimiento continuo detenido (sin keep-alive)");
+        }
+        break;
+
+    default:  // WAIT_SYNC_*: lo resuelve checkSync()
+        break;
+    }
 }
 
 void handleMotor2() {
-    static State2 lastState2 = IDLE2; // Keep track of the previous state
-    static int normalSpeed_m2; // Para guardar la velocidad antes del homing fino
+    static State2 lastState2 = IDLE2;
     if (currentState2 != lastState2) {
         if (currentState2 == IDLE2) {
-            digitalWrite(ENABLE2_PIN, HIGH); // Disable motor
-            digitalWrite(SLEEP2_PIN, LOW);   // Put driver to sleep
-            updateStepTimer2(false); // Ensure timer is off
+            updateStepTimer2(false);
+            enable2(false);
         } else {
-            digitalWrite(ENABLE2_PIN, LOW);  // Enable motor
-            digitalWrite(SLEEP2_PIN, HIGH);  // Wake up driver
+            enable2(true);
         }
         lastState2 = currentState2;
     }
+    if (currentState2 == IDLE2) return;
 
-    if (currentState2 == IDLE2) {
-        return; // Si está en IDLE, no hace nada más
-    }
-    
-    unsigned long now_us = micros();
     // Sensor NO (normalmente abierto): pin HIGH = libre, pin LOW = sensor activado
     bool homeSwitch = (digitalRead(LIMIT_SWITCH2_PIN) == LOW);
-    
-    // --- HOMING DE TRES FASES PRECISO PARA MOTOR 2 ---
-    if (currentState2 == HOMING2) {
-        // Fase 1: Ir hacia el sensor rápido
-        static unsigned long lastHomingPrint = 0;
-        if (millis() - lastHomingPrint > 500) {
-            lastHomingPrint = millis();
-            Serial.printf("[HOMING2] homeSwitch=%d  pos=%ld\n", homeSwitch, currentPosition2_steps);
-        }
-        motor2_direction_multiplier = -1;
-        digitalWrite(DIR2_PIN, LOW);
+
+    switch (currentState2) {
+    case HOMING2:
         if (homeSwitch) {
-            currentPosition2_steps = 0;
             updateStepTimer2(false);
+            currentPosition2_steps = 0;
+            m2BackoffCleared = false;
             currentState2 = HOMING_BACKOFF2;
-            goingForward2 = false;
+            setDir2(true);
             updateStepTimer2(true);
         }
-        return;
-    }
+        break;
 
-    if (currentState2 == HOMING_BACKOFF2) {
-        // Fase 2: Alejarse del sensor (DIR LOW) hasta liberarse + margen extra
-        motor2_direction_multiplier = 1;
-        digitalWrite(DIR2_PIN, HIGH);
+    case HOMING_BACKOFF2:
         if (!m2BackoffCleared) {
             if (!homeSwitch) {
                 m2BackoffCleared = true;
                 currentPosition2_steps = 0;
-                targetPosition2_steps = 300;
+                targetPosition2_steps = HOMING_BACKOFF_STEPS_M2;
             }
         } else if (currentPosition2_steps >= targetPosition2_steps) {
+            updateStepTimer2(false);
             m2BackoffCleared = false;
             currentPosition2_steps = 0;
-            updateStepTimer2(false);
-            normalSpeed_m2 = motor2_speed_us;
-            motor2_speed_us = normalSpeed_m2 * 2;
             currentState2 = HOMING_FINE2;
-            goingForward2 = false;
+            setDir2(false);
             updateStepTimer2(true);
         }
-        return;
-    }
+        break;
 
-    if (currentState2 == HOMING_FINE2) {
-        // Fase 3: Volver lentamente hacia el sensor (DIR HIGH, precisión)
-        motor2_direction_multiplier = -1;
-        digitalWrite(DIR2_PIN, LOW);
+    case HOMING_FINE2:
         if (homeSwitch) {
+            haltMotor2();
             currentPosition2_steps = 0;
-            updateStepTimer2(false);
-            motor2_speed_us = normalSpeed_m2;
-            currentState2 = IDLE2;
             Serial.println("Motor 2 homing preciso completado");
         }
-        return;
-    }
-    
-    if (currentState2 == PAUSE_AT_END2 || currentState2 == PAUSE_AT_START2) {
-        updateStepTimer2(false);
-        unsigned long pauseDuration = (currentState2 == PAUSE_AT_END2) ? delay_at_end2_ms : delay_at_start2_ms;
-        if ((now_us - pauseStartTime2) >= (pauseDuration * 1000UL)) {
-            goingForward2 = (currentState2 == PAUSE_AT_END2) ? false : true;
-            if (currentState2 == PAUSE_AT_START2) {
-                // Recalcular target con la distancia actual (permite cambiar en caliente)
+        break;
+
+    case PAUSE_AT_END2:
+    case PAUSE_AT_START2: {
+        unsigned long dur = (currentState2 == PAUSE_AT_END2) ? delay_at_end2_ms : delay_at_start2_ms;
+        if ((micros() - pauseStartTime2) >= dur * 1000UL) {
+            bool forward = (currentState2 == PAUSE_AT_START2);
+            if (forward) {
                 currentPosition2_steps = 0;
                 targetPosition2_steps = (long)(autoDistance2_inches * steps_per_unit_m2);
             }
+            setDir2(forward);
             currentState2 = RUNNING2;
             updateStepTimer2(true);
         }
-        return;
+        break;
     }
-    
-    if (currentState2 == RUNNING2) {
+
+    case RUNNING2:
         if (goingForward2) {
-            motor2_direction_multiplier = 1;
-            digitalWrite(DIR2_PIN, HIGH);   // igual que Motor 1
             if (currentPosition2_steps >= targetPosition2_steps) {
                 updateStepTimer2(false);
                 currentState2 = WAIT_SYNC_END2;
             }
-        } else {
-            motor2_direction_multiplier = -1;
-            digitalWrite(DIR2_PIN, LOW);  // igual que Motor 1
-            if (currentPosition2_steps <= 0) {
-                updateStepTimer2(false);
-                currentState2 = WAIT_SYNC_START2;
-            }
-        }
-    } else if (currentState2 == MANUAL_MOVE2) {
-        if (goingForward2) {
-            motor2_direction_multiplier = 1;
-            digitalWrite(DIR2_PIN, HIGH);
-            if (currentPosition2_steps >= targetPosition2_steps) {
-                updateStepTimer2(false);
-                currentState2 = IDLE2;
-            }
-        } else {
-            motor2_direction_multiplier = -1;
-            digitalWrite(DIR2_PIN, LOW);
-            if (currentPosition2_steps <= 0) {
-                updateStepTimer2(false);
-                currentState2 = IDLE2;
-            }
-        }
-    } else if (currentState2 == MANUAL_FAST_MOVE2) {
-        if (goingForward2) {
-            digitalWrite(DIR2_PIN, HIGH);
-        } else {
-            digitalWrite(DIR2_PIN, LOW);
-        }
-    } else if (currentState2 == RETURNING_HOME2) {
-        if (currentPosition2_steps > targetPosition2_steps) {
-            motor2_direction_multiplier = -1;
-            digitalWrite(DIR2_PIN, LOW);  // hacia home, igual que Motor 1
-        } else if (currentPosition2_steps < targetPosition2_steps) {
-            motor2_direction_multiplier = 1;
-            digitalWrite(DIR2_PIN, HIGH);
-        } else {
+        } else if (currentPosition2_steps <= 0) {
             updateStepTimer2(false);
-            currentState2 = IDLE2;
+            currentState2 = WAIT_SYNC_START2;
         }
+        break;
+
+    case MANUAL_MOVE2:
+    case RETURNING_HOME2:
+        if (goingForward2 ? (currentPosition2_steps >= targetPosition2_steps)
+                          : (currentPosition2_steps <= targetPosition2_steps)) {
+            haltMotor2();
+        }
+        break;
+
+    case MANUAL_FAST_MOVE2:
+        if (millis() - lastFastKeep2 > FAST_MOVE_TIMEOUT_MS) {
+            haltMotor2();
+            Serial.println("Motor 2: movimiento continuo detenido (sin keep-alive)");
+        }
+        break;
+
+    default:
+        break;
     }
 }
 
+// Sincroniza los extremos del ciclo. Si el otro motor no está en ciclo
+// (p. ej. /startauto1 solo), el motor continúa sin esperarlo.
 void checkSync() {
-    if (currentState == WAIT_SYNC_END && currentState2 == WAIT_SYNC_END2) {
-        currentState = PAUSE_AT_END;
-        pauseStartTime = micros();
-        currentState2 = PAUSE_AT_END2;
-        pauseStartTime2 = micros();
-    }
-    if (currentState == WAIT_SYNC_START && currentState2 == WAIT_SYNC_START2) {
-        currentState = PAUSE_AT_START;
-        pauseStartTime = micros();
-        currentState2 = PAUSE_AT_START2;
-        pauseStartTime2 = micros();
-    }
+    bool c1 = inCycle1(), c2 = inCycle2();
+    bool end1 = (currentState == WAIT_SYNC_END),     end2 = (currentState2 == WAIT_SYNC_END2);
+    bool start1 = (currentState == WAIT_SYNC_START), start2 = (currentState2 == WAIT_SYNC_START2);
+    unsigned long now = micros();
+
+    if (end1 && (end2 || !c2))     { currentState = PAUSE_AT_END;    pauseStartTime = now; }
+    if (end2 && (end1 || !c1))     { currentState2 = PAUSE_AT_END2;  pauseStartTime2 = now; }
+    if (start1 && (start2 || !c2)) { currentState = PAUSE_AT_START;   pauseStartTime = now; }
+    if (start2 && (start1 || !c1)) { currentState2 = PAUSE_AT_START2; pauseStartTime2 = now; }
 }

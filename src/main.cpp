@@ -6,55 +6,108 @@
 #include <AsyncWebSocket.h>
 #include <Preferences.h>
 #include <ArduinoOTA.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
-// Importamos nuestras particiones de código
 #include "config.h"
 #include "motor_logic.h"
-
-// --- DECLARACIONES EXTERN (PARA QUE EL MAIN RECONOZCA LO QUE ESTÁ EN MOTOR_LOGIC.H/CPP) ---
-extern hw_timer_t *stepTimer;
-extern hw_timer_t *stepTimer2;
-
-extern volatile long currentPosition_steps;
-extern volatile long currentPosition2_steps;
-extern volatile long targetPosition_steps;
-extern volatile long targetPosition2_steps;
-extern volatile int motor_speed_us;
-extern volatile int motor2_speed_us;
-
-extern volatile State currentState;
-extern volatile State2 currentState2;
-
-extern volatile bool goingForward;
-extern volatile bool goingForward2;
-extern volatile int motor1_direction_multiplier;
-extern volatile int motor2_direction_multiplier;
-
-extern volatile unsigned long delay_at_end_ms;
-extern volatile unsigned long delay_at_start_ms;
-extern volatile unsigned long delay_at_end2_ms;
-extern volatile unsigned long delay_at_start2_ms;
-
-extern volatile float autoDistance_inches;
-extern volatile float autoDistance2_inches;
-
-extern void updateStepTimer(bool enable);
-extern void updateStepTimer2(bool enable);
-extern void homingMotor2();
-extern void startBothMotors();
-extern void stopBothMotors();
-extern void handleMotor();
-extern void handleMotor2();
-extern void checkSync();
 
 // Instancias Globales
 AsyncWebServer server(80);
 Preferences pref;
-AsyncWebSocket ws("/ws"); // Declaración del servidor WebSocket en el endpoint /ws
+AsyncWebSocket ws("/ws");
 
-// Función para enviar las posiciones de los motores a todos los clientes WebSocket conectados
+// --- COLA DE COMANDOS ---
+// Los handlers HTTP corren en la tarea de AsyncTCP; para no modificar el estado de
+// los motores en paralelo con loop(), encolan el comando y loop() lo ejecuta.
+enum CmdType : uint8_t {
+    CMD_START_BOTH, CMD_STOP_BOTH,
+    CMD_HOME1, CMD_HOME2,
+    CMD_SPEED1, CMD_SPEED2,
+    CMD_MOVEBY1, CMD_MOVEBY2,
+    CMD_FAST1, CMD_FAST2, CMD_STOPFAST1, CMD_STOPFAST2,
+    CMD_STARTAUTO1, CMD_STARTAUTO2, CMD_STOPAUTO1, CMD_STOPAUTO2
+};
+
+struct Command {
+    CmdType type;
+    float a;   // distancia (NAN = no indicada)
+    float b;   // segunda distancia (NAN = no indicada)
+    int i;     // velocidad / dirección (1 = adelante)
+};
+
+static QueueHandle_t cmdQueue = nullptr;
+
+// El paro de emergencia no pasa por la cola: el flag detiene las ISRs al instante
+// y loop() completa el paro después de procesar la cola, así siempre gana.
+static volatile bool estopRequested = false;
+
+static void requestEmergencyStop() {
+    emergencyStop = true;
+    estopRequested = true;
+}
+
+static void enqueue(AsyncWebServerRequest *request, CmdType type, float a = NAN, float b = NAN, int i = 0) {
+    Command c{type, a, b, i};
+    if (xQueueSend(cmdQueue, &c, 0) == pdTRUE) {
+        request->send(200, "text/plain", "OK");
+    } else {
+        request->send(503, "text/plain", "BUSY");
+    }
+}
+
+static float optFloatArg(AsyncWebServerRequest *request, const char *name) {
+    return request->hasArg(name) ? request->arg(name).toFloat() : NAN;
+}
+
+static void processCommands() {
+    Command c;
+    while (xQueueReceive(cmdQueue, &c, 0) == pdTRUE) {
+        switch (c.type) {
+        case CMD_START_BOTH:
+            // Solo aplica distancias si realmente arranca (START en marcha no hace nada)
+            if (currentState == IDLE && currentState2 == IDLE2) {
+                if (!isnan(c.a)) autoDistance_inches = c.a;
+                if (!isnan(c.b)) autoDistance2_inches = c.b;
+                startBothMotors();
+            }
+            break;
+        case CMD_STOP_BOTH:  stopBothMotors(); break;
+        case CMD_HOME1:      homingMotor1(); break;
+        case CMD_HOME2:      homingMotor2(); break;
+        case CMD_SPEED1:
+            if (c.i >= 50) { setSpeed1(c.i); pref.putInt("speed1", c.i); }
+            break;
+        case CMD_SPEED2:
+            if (c.i >= 50) { setSpeed2(c.i); pref.putInt("speed2", c.i); }
+            break;
+        case CMD_MOVEBY1:    moveBy1(c.i == 1, c.a); break;
+        case CMD_MOVEBY2:    moveBy2(c.i == 1, c.a); break;
+        case CMD_FAST1:      fastMove1(c.i == 1); break;
+        case CMD_FAST2:      fastMove2(c.i == 1); break;
+        case CMD_STOPFAST1:  stopFast1(); break;
+        case CMD_STOPFAST2:  stopFast2(); break;
+        case CMD_STARTAUTO1:
+            if (currentState == IDLE) {
+                if (!isnan(c.a)) { autoDistance_inches = c.a; pref.putFloat("dist1", c.a); }
+                startAuto1();
+            }
+            break;
+        case CMD_STARTAUTO2:
+            if (currentState2 == IDLE2) {
+                if (!isnan(c.a)) { autoDistance2_inches = c.a; pref.putFloat("dist2", c.a); }
+                startAuto2();
+            }
+            break;
+        case CMD_STOPAUTO1:  stopAuto1(); break;
+        case CMD_STOPAUTO2:  stopAuto2(); break;
+        }
+    }
+}
+
+// Envía las posiciones de los motores a todos los clientes WebSocket
 void sendMotorPositions() {
-    if (ws.count() == 0) return; // No hay clientes conectados, no hacer nada
+    if (ws.count() == 0) return;
 
     JsonDocument doc;
     doc["pos1"] = (float)currentPosition_steps / steps_per_unit_m1;
@@ -62,24 +115,16 @@ void sendMotorPositions() {
 
     String jsonString;
     serializeJson(doc, jsonString);
-    ws.textAll(jsonString); // Envía el JSON a todos los clientes conectados
+    ws.textAll(jsonString);
 }
 
-// Manejador de eventos del WebSocket
-void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len){
-    if(type == WS_EVT_CONNECT){
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+    if (type == WS_EVT_CONNECT) {
         Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
-        // Envía las posiciones iniciales al cliente recién conectado
-        sendMotorPositions();
-    } else if(type == WS_EVT_DISCONNECT){
+    } else if (type == WS_EVT_DISCONNECT) {
         Serial.printf("WebSocket client #%u disconnected\n", client->id());
-    } else if(type == WS_EVT_DATA){
-        // Aquí puedes manejar los datos recibidos del cliente si fuera necesario
-        // Por ahora, solo enviamos datos del servidor al cliente
-    } else if(type == WS_EVT_PONG){
-        // Pong recibido
-    } else if(type == WS_EVT_ERROR){
-        Serial.printf("WebSocket client #%u error(%u): %s\n", client->id(), *((uint16_t*)arg), (char*)data);
+    } else if (type == WS_EVT_ERROR) {
+        Serial.printf("WebSocket client #%u error(%u): %s\n", client->id(), *((uint16_t *)arg), (char *)data);
     }
 }
 
@@ -92,76 +137,72 @@ bool lastStartState = HIGH;
 bool lastStopState = HIGH;
 bool lastEmergencyState = HIGH;
 
+static bool otaStarted = false;
+
 void setup() {
     Serial.begin(115200);
 
-    // 1. Iniciar Sistema de Archivos y Preferencias
+    cmdQueue = xQueueCreate(16, sizeof(Command));
+
+    // 1. Sistema de archivos y preferencias
     if (!LittleFS.begin(true)) {
         Serial.println("Error al montar LittleFS");
     }
     pref.begin("cnc-data", false);
 
-    // 2. Configuración de Pines (Definidos en config.h)
+    // 2. Pines (motores deshabilitados al arrancar)
     pinMode(STEP_PIN, OUTPUT);
     pinMode(DIR_PIN, OUTPUT);
     pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
     pinMode(STEP2_PIN, OUTPUT);
     pinMode(DIR2_PIN, OUTPUT);
     pinMode(LIMIT_SWITCH2_PIN, INPUT_PULLUP);
+    pinMode(ENABLE_PIN, OUTPUT);
+    digitalWrite(ENABLE_PIN, HIGH);
     pinMode(ENABLE2_PIN, OUTPUT);
     digitalWrite(ENABLE2_PIN, HIGH);
     pinMode(SLEEP2_PIN, OUTPUT);
-    // Ensure ENABLE_PIN for Motor 1 is also initialized and set to HIGH (disabled)
-    pinMode(ENABLE_PIN, OUTPUT);
-    digitalWrite(ENABLE_PIN, HIGH);
     digitalWrite(SLEEP2_PIN, LOW);
-    
+
     pinMode(START_BUTTON_PIN, INPUT_PULLUP);
     pinMode(STOP_BUTTON_PIN, INPUT_PULLUP);
     pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);
 
-    // 3. Cargar valores guardados de Preferences
+    // 3. Valores guardados
     currentPosition_steps = pref.getLong("pos1", 0);
     motor_speed_us = pref.getInt("speed1", 400);
     autoDistance_inches = pref.getFloat("dist1", 0.4);
     delay_at_end_ms = pref.getULong("delayEnd1", 0);
     delay_at_start_ms = pref.getULong("delayStart1", 0);
-    
+
     currentPosition2_steps = pref.getLong("pos2", 0);
     motor2_speed_us = pref.getInt("speed2", 800);
     autoDistance2_inches = pref.getFloat("dist2", 0.4);
     delay_at_end2_ms = pref.getULong("delayEnd2", 0);
     delay_at_start2_ms = pref.getULong("delayStart2", 0);
 
-    // 4. Configurar Timers de Hardware (Sintaxis compatible con v2.0.14)
-    // Motor 1
-    stepTimer = timerBegin(0, 80, true); 
+    // 4. Timers de hardware (API arduino-esp32 v2.x), apagados hasta recibir orden
+    stepTimer = timerBegin(0, 80, true);
     timerAttachInterrupt(stepTimer, &onStepTimer, true);
     timerAlarmWrite(stepTimer, motor_speed_us, true);
-    timerAlarmEnable(stepTimer);
+    timerAlarmDisable(stepTimer);
 
-    // Motor 2
     stepTimer2 = timerBegin(1, 80, true);
     timerAttachInterrupt(stepTimer2, &onStepTimer2, true);
     timerAlarmWrite(stepTimer2, motor2_speed_us, true);
-    timerAlarmEnable(stepTimer2);
-
-    // Inicialmente apagados hasta recibir orden
-    timerAlarmDisable(stepTimer);
     timerAlarmDisable(stepTimer2);
 
-    // 5. Conectar WiFi
+    // 5. WiFi sin bloquear: los botones físicos y el paro de emergencia funcionan
+    //    aunque no haya red. La conexión y el OTA se completan desde loop().
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PW);
-    Serial.print("Conectando a WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println("\nConectado. IP: " + WiFi.localIP().toString());
+    Serial.println("Conectando a WiFi (en segundo plano)...");
 
-    // 5.5 Configurar OTA (Over-The-Air Updates)
+    // 5.5 OTA (se inicia en loop() cuando hay conexión)
     ArduinoOTA.setHostname("Corte-Bobinas-OTA");
     ArduinoOTA.onStart([]() {
+        emergencyStopAll();  // nunca actualizar con motores en movimiento
         Serial.println("\n\n=== Actualizando por OTA ===");
     });
     ArduinoOTA.onEnd([]() {
@@ -175,14 +216,12 @@ void setup() {
         else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
         else if (error == OTA_END_ERROR) Serial.println("End Failed");
     });
-    ArduinoOTA.begin();
-    Serial.println("OTA activado - Actualizable por WiFi");
-    
-    // 6. Configurar WebSocket
-    ws.onEvent(onWsEvent);
-    server.addHandler(&ws); // Añade el manejador WebSocket al servidor
 
-    server.on("/getsettings", HTTP_GET, [](AsyncWebServerRequest *request){
+    // 6. WebSocket y endpoints
+    ws.onEvent(onWsEvent);
+    server.addHandler(&ws);
+
+    server.on("/getsettings", HTTP_GET, [](AsyncWebServerRequest *request) {
         JsonDocument doc;
         doc["dist1"] = autoDistance_inches;
         doc["speed1"] = motor_speed_us;
@@ -197,345 +236,236 @@ void setup() {
         request->send(200, "application/json", output);
     });
 
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (LittleFS.exists("/index.html")) {
-        request->send(LittleFS, "/index.html", "text/html");
-    } 
-    else if (LittleFS.exists("index.html")) {
-        request->send(LittleFS, "index.html", "text/html");
-    }
-    else {
-        // Si llega aquí, es que LittleFS está realmente vacío
-        String errorMsg = "Error: index.html no existe en la memoria.\n";
-        errorMsg += "Archivos encontrados:\n";
-        
-        File root = LittleFS.open("/");
-        File file = root.openNextFile();
-        while(file){
-            errorMsg += String(file.name()) + " (" + String(file.size()) + " bytes)\n";
-            file = root.openNextFile();
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (LittleFS.exists("/index.html")) {
+            request->send(LittleFS, "/index.html", "text/html");
+        } else {
+            String errorMsg = "Error: index.html no existe en la memoria.\nArchivos encontrados:\n";
+            File root = LittleFS.open("/");
+            File file = root.openNextFile();
+            while (file) {
+                errorMsg += String(file.name()) + " (" + String(file.size()) + " bytes)\n";
+                file = root.openNextFile();
+            }
+            request->send(404, "text/plain", errorMsg);
         }
-        request->send(404, "text/plain", errorMsg);
-    }
-});
-    server.on("/startboth", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("dist1")) autoDistance_inches = request->arg("dist1").toFloat();
-        if(request->hasArg("dist2")) autoDistance2_inches = request->arg("dist2").toFloat();
-        startBothMotors();
+    });
+
+    // --- CICLO DE AMBOS MOTORES ---
+    server.on("/startboth", HTTP_GET, [](AsyncWebServerRequest *request) {
+        enqueue(request, CMD_START_BOTH, optFloatArg(request, "dist1"), optFloatArg(request, "dist2"));
+    });
+    server.on("/stopboth", HTTP_GET, [](AsyncWebServerRequest *request) {
+        enqueue(request, CMD_STOP_BOTH);
+    });
+    server.on("/stopall", HTTP_GET, [](AsyncWebServerRequest *request) {
+        requestEmergencyStop();
         request->send(200, "text/plain", "OK");
     });
 
-    server.on("/stopboth", HTTP_GET, [](AsyncWebServerRequest *request){
-        stopBothMotors();
-        request->send(200, "text/plain", "OK");
-        digitalWrite(ENABLE_PIN, LOW); // Ensure motor 1 is enabled for returning home
-        digitalWrite(ENABLE2_PIN, LOW); // Ensure motor 2 is enabled for returning home
-    });
-
-    server.on("/stopall", HTTP_GET, [](AsyncWebServerRequest *request){
-        // Paro de emergencia: emergencyStop se activa PRIMERO para detener ISRs inmediatamente
-        emergencyStop = true;
-        updateStepTimer(false);
-        updateStepTimer2(false);
-        currentState  = IDLE;
-        currentState2 = IDLE2;
-        digitalWrite(ENABLE_PIN,  HIGH);
-        digitalWrite(ENABLE2_PIN, HIGH);
-        request->send(200, "text/plain", "OK");
-    });
-
-    server.on("/saveMem", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, 
-        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+    // --- MEMORIAS ---
+    server.on("/saveMem", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            // El cuerpo puede llegar en varios fragmentos: acumular en un búfer.
+            // La librería libera _tempObject con free(), por eso se usa malloc.
+            if (total > 2048) {
+                if (index == 0) request->send(413, "text/plain", "demasiado grande");
+                return;
+            }
+            if (index == 0) {
+                request->_tempObject = malloc(total + 1);
+                if (!request->_tempObject) { request->send(500, "text/plain", "sin memoria"); return; }
+            }
+            char *body = (char *)request->_tempObject;
+            if (!body) return;
+            memcpy(body + index, data, len);
+            if (index + len < total) return;
+            body[total] = '\0';
             int num = request->arg("num").toInt();
-            String jsonBody = "";
-            for (size_t i = 0; i < len; i++) jsonBody += (char)data[i];
-            String key = "mem" + String(num);
-            pref.putString(key.c_str(), jsonBody);
-            request->send(200, "text/plain", "OK");
-    });
+            if (num >= 1 && num <= 3) {
+                String key = "mem" + String(num);
+                pref.putString(key.c_str(), body);
+                request->send(200, "text/plain", "OK");
+            } else {
+                request->send(400, "text/plain", "num invalido");
+            }
+        });
 
-    server.on("/loadMem", HTTP_GET, [](AsyncWebServerRequest *request){
+    server.on("/loadMem", HTTP_GET, [](AsyncWebServerRequest *request) {
         int num = request->arg("num").toInt();
         String key = "mem" + String(num);
         String json = pref.getString(key.c_str(), "{}");
         request->send(200, "application/json", json);
     });
 
-    // --- ENDPOINTS PARA HOMING ---
-    server.on("/homing", HTTP_GET, [](AsyncWebServerRequest *request){
-        emergencyStop = false;
-        currentPosition_steps = 0;
-        currentState = HOMING;
-        updateStepTimer(true);
-        digitalWrite(ENABLE_PIN, LOW); // Enable motor 1
-        request->send(200, "text/plain", "Homing Motor 1 preciso iniciado");
+    // --- HOMING ---
+    server.on("/homing", HTTP_GET, [](AsyncWebServerRequest *request) {
+        enqueue(request, CMD_HOME1);
+    });
+    server.on("/homingmotor2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        enqueue(request, CMD_HOME2);
     });
 
-    server.on("/homingmotor2", HTTP_GET, [](AsyncWebServerRequest *request){
-        // Inicia homing preciso del motor 2
-        homingMotor2();
-        request->send(200, "text/plain", "Homing Motor 2 preciso iniciado");
+    // --- VELOCIDAD ---
+    server.on("/speed1", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasArg("val")) { request->send(400, "text/plain", "falta val"); return; }
+        enqueue(request, CMD_SPEED1, NAN, NAN, request->arg("val").toInt());
+    });
+    server.on("/speed2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasArg("val")) { request->send(400, "text/plain", "falta val"); return; }
+        enqueue(request, CMD_SPEED2, NAN, NAN, request->arg("val").toInt());
     });
 
-    // --- ENDPOINTS PARA VELOCIDAD ---
-    server.on("/speed1", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("val")) {
-            int speed = request->arg("val").toInt();
-            if(speed >= 50) {
-                motor_speed_us = speed;
-                pref.putInt("speed1", speed);
-                if (currentState != IDLE) timerAlarmWrite(stepTimer, motor_speed_us, true);
-            }
-        }
-        request->send(200, "text/plain", "OK");
-    });
-
-    server.on("/speed2", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("val")) {
-            int speed = request->arg("val").toInt();
-            if(speed >= 50) {
-                motor2_speed_us = speed;
-                pref.putInt("speed2", speed);
-                if (currentState2 != IDLE2) timerAlarmWrite(stepTimer2, motor2_speed_us, true);
-            }
-        }
-        request->send(200, "text/plain", "OK");
-    });
-
-    // --- ENDPOINTS PARA DISTANCIA ---
-    server.on("/setdist1", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("val")) {
+    // --- DISTANCIA (variables atómicas; se aplican en el próximo inicio de carrera) ---
+    server.on("/setdist1", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->hasArg("val")) {
             autoDistance_inches = request->arg("val").toFloat();
             pref.putFloat("dist1", autoDistance_inches);
         }
         request->send(200, "text/plain", "OK");
     });
-
-    server.on("/setdist2", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("val")) {
+    server.on("/setdist2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->hasArg("val")) {
             autoDistance2_inches = request->arg("val").toFloat();
             pref.putFloat("dist2", autoDistance2_inches);
         }
         request->send(200, "text/plain", "OK");
     });
 
-    // --- ENDPOINTS PARA PAUSAS ---
-    server.on("/delaystart1", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("val")) {
+    // --- PAUSAS ---
+    server.on("/delaystart1", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->hasArg("val")) {
             delay_at_start_ms = request->arg("val").toInt();
             pref.putULong("delayStart1", delay_at_start_ms);
         }
         request->send(200, "text/plain", "OK");
     });
-
-    server.on("/delayend1", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("val")) {
+    server.on("/delayend1", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->hasArg("val")) {
             delay_at_end_ms = request->arg("val").toInt();
             pref.putULong("delayEnd1", delay_at_end_ms);
         }
         request->send(200, "text/plain", "OK");
     });
-
-    server.on("/delaystart2", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("val")) {
+    server.on("/delaystart2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->hasArg("val")) {
             delay_at_start2_ms = request->arg("val").toInt();
             pref.putULong("delayStart2", delay_at_start2_ms);
         }
         request->send(200, "text/plain", "OK");
     });
-
-    server.on("/delayend2", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("val")) {
+    server.on("/delayend2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->hasArg("val")) {
             delay_at_end2_ms = request->arg("val").toInt();
             pref.putULong("delayEnd2", delay_at_end2_ms);
         }
         request->send(200, "text/plain", "OK");
     });
 
-    // --- ENDPOINTS PARA CONTROL MANUAL (ADELANTE/ATRÁS) ---
-    server.on("/moveby1", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("dir") && request->hasArg("dist")) {
-            String dir = request->arg("dir");
-            float dist = request->arg("dist").toFloat();
-            long steps = (long)(dist * steps_per_unit_m1);
-            
-            goingForward = (dir == "forward");
-            motor1_direction_multiplier = goingForward ? 1 : -1; // Set direction for ISR
-            if (goingForward) {
-                currentPosition_steps = 0;
-                targetPosition_steps = steps;
-            } else {
-                // Para ir hacia atrás, invertir la lógica
-                currentPosition_steps = steps;
-                targetPosition_steps = 0;
-            }
-            currentState = MANUAL_MOVE;
-            updateStepTimer(true);
-            digitalWrite(ENABLE_PIN, LOW); // Enable motor 1
-        }
-        request->send(200, "text/plain", "OK");
+    // --- MOVIMIENTO RELATIVO (solo con el motor en IDLE) ---
+    server.on("/moveby1", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasArg("dir") || !request->hasArg("dist")) { request->send(400, "text/plain", "faltan dir/dist"); return; }
+        enqueue(request, CMD_MOVEBY1, request->arg("dist").toFloat(), NAN, request->arg("dir") == "forward" ? 1 : 0);
+    });
+    server.on("/moveby2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasArg("dir") || !request->hasArg("dist")) { request->send(400, "text/plain", "faltan dir/dist"); return; }
+        enqueue(request, CMD_MOVEBY2, request->arg("dist").toFloat(), NAN, request->arg("dir") == "forward" ? 1 : 0);
     });
 
-    server.on("/moveby2", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(request->hasArg("dir") && request->hasArg("dist")) {
-            String dir = request->arg("dir");
-            float dist = request->arg("dist").toFloat();
-            long steps = (long)(dist * steps_per_unit_m2);
-            
-            goingForward2 = (dir == "forward");
-            motor2_direction_multiplier = goingForward2 ? 1 : -1; // Set direction for ISR
-            if (goingForward2) {
-                currentPosition2_steps = 0;
-                targetPosition2_steps = steps;
-            } else {
-                // Para ir hacia atrás, invertir la lógica
-                currentPosition2_steps = steps;
-                targetPosition2_steps = 0;
-            }
-            currentState2 = MANUAL_MOVE2;
-            updateStepTimer2(true);
-            digitalWrite(ENABLE2_PIN, LOW); // Enable motor 2
-        }
+    // --- MOVIMIENTO CONTINUO (mantener presionado; requiere keep-alive) ---
+    server.on("/movefast1", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasArg("dir")) { request->send(400, "text/plain", "falta dir"); return; }
+        enqueue(request, CMD_FAST1, NAN, NAN, request->arg("dir") == "forward" ? 1 : 0);
+    });
+    server.on("/movefast2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasArg("dir")) { request->send(400, "text/plain", "falta dir"); return; }
+        enqueue(request, CMD_FAST2, NAN, NAN, request->arg("dir") == "forward" ? 1 : 0);
+    });
+    server.on("/keepfast1", HTTP_GET, [](AsyncWebServerRequest *request) {
+        keepFast1();
         request->send(200, "text/plain", "OK");
+    });
+    server.on("/keepfast2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        keepFast2();
+        request->send(200, "text/plain", "OK");
+    });
+    server.on("/stopfast1", HTTP_GET, [](AsyncWebServerRequest *request) {
+        enqueue(request, CMD_STOPFAST1);
+    });
+    server.on("/stopfast2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        enqueue(request, CMD_STOPFAST2);
     });
 
-    // --- ENDPOINTS PARA MOVIMIENTO CONTINUO (PRESIÓN LARGA) ---
-    server.on("/movefast1", HTTP_GET, [](AsyncWebServerRequest *request){
-        emergencyStop = false;
-        if(request->hasArg("dir")) {
-            String dir = request->arg("dir");
-            goingForward = (dir == "forward");
-            motor1_direction_multiplier = goingForward ? 1 : -1; // Set direction for ISR
-            currentState = MANUAL_FAST_MOVE;
-            updateStepTimer(true);
-            digitalWrite(ENABLE_PIN, LOW); // Enable motor 1
-        }
-        request->send(200, "text/plain", "OK");
+    // --- CICLO AUTOMÁTICO POR MOTOR ---
+    server.on("/startauto1", HTTP_GET, [](AsyncWebServerRequest *request) {
+        enqueue(request, CMD_STARTAUTO1, optFloatArg(request, "dist"));
     });
-    
-    server.on("/stopfast1", HTTP_GET, [](AsyncWebServerRequest *request){
-        updateStepTimer(false);
-        currentState = IDLE;
-        request->send(200, "text/plain", "OK");
+    server.on("/stopauto1", HTTP_GET, [](AsyncWebServerRequest *request) {
+        enqueue(request, CMD_STOPAUTO1);
     });
-
-    server.on("/movefast2", HTTP_GET, [](AsyncWebServerRequest *request){
-        emergencyStop = false;
-        if(request->hasArg("dir")) {
-            String dir = request->arg("dir");
-            goingForward2 = (dir == "forward");
-            motor2_direction_multiplier = goingForward2 ? 1 : -1; // Set direction for ISR
-            currentState2 = MANUAL_FAST_MOVE2;
-            updateStepTimer2(true);
-            digitalWrite(ENABLE2_PIN, LOW); // Enable motor 2
-        }
-        request->send(200, "text/plain", "OK");
+    server.on("/startauto2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        enqueue(request, CMD_STARTAUTO2, optFloatArg(request, "dist"));
     });
-    
-    server.on("/stopfast2", HTTP_GET, [](AsyncWebServerRequest *request){
-        updateStepTimer2(false);
-        currentState2 = IDLE2;
-        request->send(200, "text/plain", "OK");
-    });
-
-    // --- ENDPOINTS PARA CICLOS AUTOMÁTICOS (POR MOTOR) ---
-    server.on("/startauto1", HTTP_GET, [](AsyncWebServerRequest *request){
-        emergencyStop = false;
-        if(request->hasArg("dist")) {
-            autoDistance_inches = request->arg("dist").toFloat();
-            pref.putFloat("dist1", autoDistance_inches);
-        }
-        currentPosition_steps = 0;
-        targetPosition_steps = (long)(autoDistance_inches * steps_per_unit_m1);
-        goingForward = true;
-        currentState = RUNNING;
-        motor1_direction_multiplier = 1; // Set direction for ISR
-        updateStepTimer(true);
-        request->send(200, "text/plain", "OK");
-    });
-
-    server.on("/stopauto1", HTTP_GET, [](AsyncWebServerRequest *request){
-        targetPosition_steps = 0;
-        currentState = RETURNING_HOME;
-        motor1_direction_multiplier = -1; // Set direction for ISR (returning home is backward)
-        updateStepTimer(true);
-        request->send(200, "text/plain", "OK");
-    });
-
-    server.on("/startauto2", HTTP_GET, [](AsyncWebServerRequest *request){
-        emergencyStop = false;
-        if(request->hasArg("dist")) {
-            autoDistance2_inches = request->arg("dist").toFloat();
-            pref.putFloat("dist2", autoDistance2_inches);
-        }
-        currentPosition2_steps = 0;
-        targetPosition2_steps = (long)(autoDistance2_inches * steps_per_unit_m2);
-        goingForward2 = true;
-        currentState2 = RUNNING2;
-        motor2_direction_multiplier = 1; // Set direction for ISR
-        updateStepTimer2(true);
-        request->send(200, "text/plain", "OK");
-    });
-
-    server.on("/stopauto2", HTTP_GET, [](AsyncWebServerRequest *request){
-        targetPosition2_steps = 0;
-        currentState2 = RETURNING_HOME2;
-        motor2_direction_multiplier = -1; // Set direction for ISR (returning home is backward)
-        updateStepTimer2(true);
-        request->send(200, "text/plain", "OK");
+    server.on("/stopauto2", HTTP_GET, [](AsyncWebServerRequest *request) {
+        enqueue(request, CMD_STOPAUTO2);
     });
 
     server.begin();
 }
 
 void loop() {
-    // Manejar OTA updates
-    ArduinoOTA.handle();
-
-    // Limpiar clientes WebSocket desconectados
-    ws.cleanupClients();
-    // Enviar posiciones de motores periódicamente a través de WebSocket
-    static unsigned long lastWsSendTime = 0;
-    if (millis() - lastWsSendTime > 100) { // Envía actualizaciones cada 100ms
-        sendMotorPositions();
-        lastWsSendTime = millis();
-    }
-    
-    handleMotor();
-    handleMotor2();
-    checkSync();
-
-    // Lógica de botones físicos
-    bool startRead = digitalRead(START_BUTTON_PIN);
-    bool stopRead = digitalRead(STOP_BUTTON_PIN);
     unsigned long now = millis();
 
+    // --- Red / OTA ---
+    if (!otaStarted && WiFi.status() == WL_CONNECTED) {
+        Serial.println("WiFi conectado. IP: " + WiFi.localIP().toString());
+        ArduinoOTA.begin();
+        otaStarted = true;
+        Serial.println("OTA activado - Actualizable por WiFi");
+    }
+    if (otaStarted) ArduinoOTA.handle();
+
+    ws.cleanupClients();
+    static unsigned long lastWsSendTime = 0;
+    if (now - lastWsSendTime > 100) {
+        sendMotorPositions();
+        lastWsSendTime = now;
+    }
+
+    // --- Botones físicos ---
+    bool emergencyRead = digitalRead(EMERGENCY_STOP_PIN);
+    if (emergencyRead == LOW && lastEmergencyState == HIGH && (now - lastEmergencyPress > debounceDelay)) {
+        lastEmergencyPress = now;
+        requestEmergencyStop();
+    }
+    lastEmergencyState = emergencyRead;
+
+    bool startRead = digitalRead(START_BUTTON_PIN);
     if (startRead == LOW && lastStartState == HIGH && (now - lastStartPress > debounceDelay)) {
         lastStartPress = now;
-        startBothMotors();
+        startBothMotors();  // ignorado si algún motor está en movimiento
     }
     lastStartState = startRead;
 
+    bool stopRead = digitalRead(STOP_BUTTON_PIN);
     if (stopRead == LOW && lastStopState == HIGH && (now - lastStopPress > debounceDelay)) {
         lastStopPress = now;
         stopBothMotors();
     }
     lastStopState = stopRead;
 
-    bool emergencyRead = digitalRead(EMERGENCY_STOP_PIN);
-    if (emergencyRead == LOW && lastEmergencyState == HIGH && (now - lastEmergencyPress > debounceDelay)) {
-        lastEmergencyPress = now;
-        emergencyStop = true;   // detener ISRs inmediatamente
-        updateStepTimer(false);
-        updateStepTimer2(false);
-        currentState  = IDLE;
-        currentState2 = IDLE2;
-        digitalWrite(ENABLE_PIN,  HIGH);
-        digitalWrite(ENABLE2_PIN, HIGH);
+    // --- Comandos web; el paro de emergencia se aplica al final para que siempre gane ---
+    processCommands();
+    if (estopRequested) {
+        estopRequested = false;
+        emergencyStopAll();
     }
-    lastEmergencyState = emergencyRead;
 
-    // Guardado de posición en Preferences al entrar en IDLE
+    handleMotor();
+    handleMotor2();
+    checkSync();
+
+    // Guardado de posición al entrar en IDLE
     static State lastS = IDLE;
     if (currentState == IDLE && lastS != IDLE) pref.putLong("pos1", currentPosition_steps);
     lastS = currentState;

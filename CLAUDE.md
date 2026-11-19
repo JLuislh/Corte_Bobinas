@@ -17,7 +17,7 @@ platformio run
 # Upload via USB (COM3)
 platformio run --target upload
 
-# Upload via OTA (WiFi, target IP: 192.168.1.224)
+# Upload via OTA (WiFi, target IP: 192.168.1.186)
 platformio run --env esp32dev-ota --target upload
 
 # Upload filesystem (web UI to LittleFS)
@@ -53,13 +53,15 @@ Motor control is **interrupt-driven** using ESP32 hardware timers:
 
 **Step resolutions** (defined in `config.h`):
 - Motor 1: 8128 steps/unit
-- Motor 2: 1016 steps/unit
+- Motor 2: 667 steps/unit
 
 ### Web Interface & API
 
 The async web server (`ESPAsyncWebServer`) handles REST endpoints and a WebSocket at `/ws` that streams position updates every 100ms.
 
 REST endpoints follow the pattern `/action[motor]` — e.g., `/startboth`, `/stopboth`, `/homing`, `/homingmotor2`, `/speed1`, `/speed2`, `/moveby1`, `/moveby2`, `/movefast1`, `/stopfast1`, `/saveMem`, `/loadMem`, `/getsettings`.
+
+HTTP handlers run on the AsyncTCP task, so motion endpoints only enqueue a `Command` (FreeRTOS queue in `main.cpp`); `loop()` executes them via the API in `motor_logic.h`. Emergency stop sets `emergencyStop` immediately and is applied after the queue so it always wins. Motion commands are ignored unless the motor is `IDLE` (START while running does nothing). Hold-to-move (`/movefast*`) needs `/keepfast*` every 250 ms or the firmware stops after 1 s.
 
 The web UI (`data/index.html`) is pure HTML/CSS/JS — no build step needed. After editing it, re-upload the filesystem with `uploadfs`.
 

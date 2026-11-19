@@ -15,7 +15,7 @@
         .btn-home { background: #fbbc05; color: #333; width: 100%; }
         .btn-start { background: #34a853; color: white; width: 100%; }
         .btn-stop { background: #ea4335; color: white; width: 100%; }
-        .btn-manual { background: #ff6d01; color: white; width: 48%; display: inline-block; }
+        .btn-manual { background: #ff6d01; color: white; width: 48%; display: inline-block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
         .btn-both { background: #673ab7; color: white; width: 200px; }
         .btn-emergency { background: #b71c1c; color: white; width: 100%; font-size: 22px; padding: 20px; border-radius: 16px; border: 4px solid #ff1744; letter-spacing: 2px; box-shadow: 0 0 18px rgba(183,28,28,0.5); }
         .btn-emergency:hover { background: #d32f2f; box-shadow: 0 0 28px rgba(183,28,28,0.8); }
@@ -110,7 +110,7 @@
             <button onclick="increment('dist1', parseFloat(document.getElementById('dist1').step))">+</button>
         </div>
 
-        <label>Velocidad (µs/paso):</label>
+        <label>Velocidad (µs por medio pulso · menor = más rápido):</label>
         <div class="input-group">
             <button onclick="decrement('speed1', parseFloat(document.getElementById('speed1').step))">−</button>
             <input type="number" id="speed1" step="1" min="50" value="400">
@@ -132,8 +132,8 @@
         </div>
         
         <div class="flex" style="margin-top: 15px;">
-            <button class="btn-manual" onmousedown="onMoveButtonDown1('backward')" onmouseup="onMoveButtonUp1('backward')" onmouseleave="onMoveButtonUp1('backward')">◀ ATRÁS</button>
-            <button class="btn-manual" onmousedown="onMoveButtonDown1('forward')" onmouseup="onMoveButtonUp1('forward')" onmouseleave="onMoveButtonUp1('forward')">ADELANTE ▶</button>
+            <button class="btn-manual" data-motor="1" data-dir="backward">◀ ATRÁS</button>
+            <button class="btn-manual" data-motor="1" data-dir="forward">ADELANTE ▶</button>
         </div>
     </div>
 
@@ -151,7 +151,7 @@
             <button onclick="increment('dist2', parseFloat(document.getElementById('dist2').step))">+</button>
         </div>
 
-        <label>Velocidad (µs/paso):</label>
+        <label>Velocidad (µs por medio pulso · menor = más rápido):</label>
         <div class="input-group">
             <button onclick="decrement('speed2', parseFloat(document.getElementById('speed2').step))">−</button>
             <input type="number" id="speed2" step="1" min="50" value="800">
@@ -173,8 +173,8 @@
         </div>
         
         <div class="flex" style="margin-top: 15px;">
-            <button class="btn-manual" onmousedown="onMoveButtonDown2('backward')" onmouseup="onMoveButtonUp2('backward')" onmouseleave="onMoveButtonUp2('backward')">◀ ATRÁS</button>
-            <button class="btn-manual" onmousedown="onMoveButtonDown2('forward')" onmouseup="onMoveButtonUp2('forward')" onmouseleave="onMoveButtonUp2('forward')">ADELANTE ▶</button>
+            <button class="btn-manual" data-motor="2" data-dir="backward">◀ ATRÁS</button>
+            <button class="btn-manual" data-motor="2" data-dir="forward">ADELANTE ▶</button>
         </div>
     </div>
 
@@ -229,22 +229,39 @@
         function startAuto1() { fetch('/startauto1?dist=' + document.getElementById('dist1').value); }
         function stopAuto1()  { fetch('/stopauto1'); }
         
-        function onMoveButtonDown1(dir) {
-            fetch('/movefast1?dir=' + dir);
-        }
-        function onMoveButtonUp1(dir) {
-            fetch('/stopfast1');
-        }
 
         function startAuto2() { fetch('/startauto2?dist=' + document.getElementById('dist2').value); }
         function stopAuto2()  { fetch('/stopauto2'); }
         
-        function onMoveButtonDown2(dir) {
-            fetch('/movefast2?dir=' + dir);
+
+        // --- Movimiento continuo: mantener presionado (mouse y pantalla táctil) ---
+        // Mientras se mantiene presionado se envía un keep-alive; si se pierde la
+        // conexión, el firmware detiene el motor solo (~1 s).
+        const holdStoppers = [];
+        function setupHold(btn) {
+            const motor = btn.dataset.motor, dir = btn.dataset.dir;
+            let timer = null;
+            const start = (e) => {
+                e.preventDefault();
+                if (timer) return;
+                try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+                fetch('/movefast' + motor + '?dir=' + dir);
+                timer = setInterval(() => fetch('/keepfast' + motor), 250);
+            };
+            const stop = () => {
+                if (!timer) return;
+                clearInterval(timer);
+                timer = null;
+                fetch('/stopfast' + motor);
+            };
+            btn.addEventListener('pointerdown', start);
+            ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => btn.addEventListener(ev, stop));
+            btn.addEventListener('contextmenu', e => e.preventDefault());
+            holdStoppers.push(stop);
         }
-        function onMoveButtonUp2(dir) {
-            fetch('/stopfast2');
-        }
+        document.querySelectorAll('.btn-manual[data-motor]').forEach(setupHold);
+        window.addEventListener('blur', () => holdStoppers.forEach(s => s()));
+        document.addEventListener('visibilitychange', () => { if (document.hidden) holdStoppers.forEach(s => s()); });
 
         function startBoth() {
             let d1 = document.getElementById('dist1').value;
