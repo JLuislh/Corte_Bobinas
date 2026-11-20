@@ -274,6 +274,14 @@ bool homingMotor2() {
     return true;
 }
 
+bool homeBothMotors() {
+    // Igual que START: con cualquier motor en movimiento no hace nada
+    if (currentState != IDLE || currentState2 != IDLE2) return false;
+    homingMotor1();
+    homingMotor2();
+    return true;
+}
+
 bool moveBy1(bool forward, float dist) {
     if (currentState != IDLE) return false;
     long steps = (long)(dist * steps_per_unit_m1);

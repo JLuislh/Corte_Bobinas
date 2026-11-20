@@ -19,6 +19,7 @@
 #define START_BUTTON_PIN         16
 #define STOP_BUTTON_PIN          17
 #define EMERGENCY_STOP_PIN       18   // TODO: verificar GPIO correcto en el hardware
+#define HOME_BUTTON_PIN          19   // Homing de ambos motores (NO a GND, pull-up interno)
 
 // --- WIFI ---
 // Credenciales en include/secrets.h (no versionado). Ver secrets.example.h

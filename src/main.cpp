@@ -132,10 +132,12 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 unsigned long lastStartPress = 0;
 unsigned long lastStopPress = 0;
 unsigned long lastEmergencyPress = 0;
+unsigned long lastHomePress = 0;
 const unsigned long debounceDelay = 200;
 bool lastStartState = HIGH;
 bool lastStopState = HIGH;
 bool lastEmergencyState = HIGH;
+bool lastHomeState = HIGH;
 
 static bool otaStarted = false;
 
@@ -167,6 +169,7 @@ void setup() {
     pinMode(START_BUTTON_PIN, INPUT_PULLUP);
     pinMode(STOP_BUTTON_PIN, INPUT_PULLUP);
     pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);
+    pinMode(HOME_BUTTON_PIN, INPUT_PULLUP);
 
     // 3. Valores guardados
     currentPosition_steps = pref.getLong("pos1", 0);
@@ -453,6 +456,15 @@ void loop() {
         stopBothMotors();
     }
     lastStopState = stopRead;
+
+    bool homeRead = digitalRead(HOME_BUTTON_PIN);
+    if (homeRead == LOW && lastHomeState == HIGH && (now - lastHomePress > debounceDelay)) {
+        lastHomePress = now;
+        // Ignorado si algún motor está en movimiento
+        if (homeBothMotors()) Serial.println("Boton HOME: homing de ambos motores iniciado");
+        else Serial.printf("Boton HOME ignorado: motor1=%d motor2=%d (no IDLE)\n", currentState, currentState2);
+    }
+    lastHomeState = homeRead;
 
     // --- Comandos web; el paro de emergencia se aplica al final para que siempre gane ---
     processCommands();

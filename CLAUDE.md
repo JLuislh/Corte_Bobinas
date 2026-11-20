@@ -61,7 +61,7 @@ The async web server (`ESPAsyncWebServer`) handles REST endpoints and a WebSocke
 
 REST endpoints follow the pattern `/action[motor]` — e.g., `/startboth`, `/stopboth`, `/homing`, `/homingmotor2`, `/speed1`, `/speed2`, `/moveby1`, `/moveby2`, `/movefast1`, `/stopfast1`, `/saveMem`, `/loadMem`, `/getsettings`.
 
-HTTP handlers run on the AsyncTCP task, so motion endpoints only enqueue a `Command` (FreeRTOS queue in `main.cpp`); `loop()` executes them via the API in `motor_logic.h`. Emergency stop sets `emergencyStop` immediately and is applied after the queue so it always wins. Motion commands are ignored unless the motor is `IDLE` (START while running does nothing). Hold-to-move (`/movefast*`) needs `/keepfast*` every 250 ms or the firmware stops after 1 s.
+HTTP handlers run on the AsyncTCP task, so motion endpoints only enqueue a `Command` (FreeRTOS queue in `main.cpp`); `loop()` executes them via the API in `motor_logic.h`. Emergency stop sets `emergencyStop` immediately and is applied after the queue so it always wins. Motion commands are ignored unless the motor is `IDLE` (START while running does nothing). Physical buttons: START (GPIO16), STOP (GPIO17), EMERGENCY (GPIO18), HOME both motors (GPIO19); START and HOME are ignored unless both motors are IDLE. Hold-to-move (`/movefast*`) needs `/keepfast*` every 250 ms or the firmware stops after 1 s.
 
 The web UI (`data/index.html`) is pure HTML/CSS/JS — no build step needed. After editing it, re-upload the filesystem with `uploadfs`.
 

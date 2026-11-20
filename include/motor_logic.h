@@ -50,6 +50,7 @@ void stopBothMotors();           // regresa a origen (o detiene el homing en cur
 void emergencyStopAll();
 bool homingMotor1();
 bool homingMotor2();
+bool homeBothMotors();           // solo arranca si ambos motores están en IDLE
 bool startAuto1();
 bool startAuto2();
 void stopAuto1();
